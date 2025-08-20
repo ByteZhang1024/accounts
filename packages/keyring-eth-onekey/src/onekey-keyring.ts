@@ -1,7 +1,15 @@
 /* eslint-disable @typescript-eslint/naming-convention */
 /* eslint-disable @typescript-eslint/no-explicit-any */
-import type { TypedTransaction, TypedTxData } from '@ethereumjs/tx';
-import { TransactionFactory } from '@ethereumjs/tx';
+import type {
+  AuthorizationList,
+  TypedTransaction,
+  TypedTxData,
+} from '@ethereumjs/tx';
+import {
+  isEOACodeEIP7702TxData,
+  TransactionFactory,
+  TransactionType,
+} from '@ethereumjs/tx';
 import * as ethUtil from '@ethereumjs/util';
 import type { MessageTypes, TypedMessage } from '@metamask/eth-sig-util';
 import { SignTypedDataVersion, TypedDataUtils } from '@metamask/eth-sig-util';
@@ -371,7 +379,7 @@ export class OneKeyKeyring extends EventEmitter {
       address,
       Number(tx.common.chainId()),
       tx,
-      (payload) => {
+      (payload, onekeySignAuthorizationList) => {
         // Because tx will be immutable, first get a plain javascript object that
         // represents the transaction. Using txData here as it aligns with the
         // nomenclature of ethereumjs/tx.
@@ -382,6 +390,23 @@ export class OneKeyKeyring extends EventEmitter {
         txData.v = ethUtil.addHexPrefix(payload.v);
         txData.r = ethUtil.addHexPrefix(payload.r);
         txData.s = ethUtil.addHexPrefix(payload.s);
+
+        if (onekeySignAuthorizationList && isEOACodeEIP7702TxData(txData)) {
+          // @ts-expect-error - OneKey chainID to number conversion
+          const { authorizationSignatures } = payload;
+          // @ts-expect-error - OneKey chainID to number conversion
+          txData.authorizationList = txData.authorizationList?.map(
+            (auth, index) => {
+              return {
+                ...auth,
+                r: ethUtil.addHexPrefix(authorizationSignatures[index].r),
+                s: ethUtil.addHexPrefix(authorizationSignatures[index].s),
+                yParity:
+                  authorizationSignatures[index].yParity === 0 ? '0x' : '0x1',
+              };
+            },
+          );
+        }
         // Adopt the 'common' option from the original transaction and set the
         // returned object to be frozen if the original is frozen.
         return TransactionFactory.fromTxData(txData, {
@@ -396,9 +421,13 @@ export class OneKeyKeyring extends EventEmitter {
     address: string,
     chainId: number,
     tx: T,
-    handleSigning: (tx: EVMSignedTx) => T,
+    handleSigning: (
+      tx: EVMSignedTx,
+      existOnekeySignAuthorizationList?: boolean,
+    ) => T,
   ): Promise<T> {
     let transaction: EVMSignTransactionParams['transaction'];
+    let existOnekeySignAuthorizationList = false;
     if (isOldStyleEthereumjsTx(tx)) {
       // legacy transaction from ethereumjs-tx package has no .toJSON() function,
       // so we need to convert to hex-strings manually manually
@@ -412,10 +441,33 @@ export class OneKeyKeyring extends EventEmitter {
         gasPrice: this.#normalize(tx.gasPrice),
       };
     } else {
+      let authorizationList: AuthorizationList | undefined;
+      if (tx.type === TransactionType.EOACodeEIP7702) {
+        // @ts-expect-error - OneKey chainID to number conversion
+        authorizationList = tx.toJSON()?.authorizationList?.map((auth) => {
+          if (auth.r === `0x` && auth.s === `0x` && auth.yParity === `0x`) {
+            existOnekeySignAuthorizationList = true;
+            return {
+              ...auth,
+              chainId: parseInt(auth.chainId?.replace('0x', ''), 16),
+              r: undefined,
+              s: undefined,
+              yParity: undefined,
+            };
+          }
+
+          return {
+            ...auth,
+            chainId: parseInt(auth.chainId?.replace('0x', ''), 16),
+          };
+        });
+      }
+
       // new-style transaction from @ethereumjs/tx package
       // we can just copy tx.toJSON() for everything except chainId, which must be a number
       transaction = {
         ...tx.toJSON(),
+        authorizationList,
         chainId,
         to: this.#normalize(Buffer.from(tx.to?.bytes ?? [])),
       } as unknown as EVMSignTransactionParams['transaction'];
@@ -430,7 +482,10 @@ export class OneKeyKeyring extends EventEmitter {
         transaction,
       });
       if (response.success) {
-        const newOrMutatedTx = handleSigning(response.payload);
+        const newOrMutatedTx = handleSigning(
+          response.payload,
+          existOnekeySignAuthorizationList,
+        );
 
         const addressSignedWith = ethUtil.toChecksumAddress(
           ethUtil.addHexPrefix(
@@ -533,6 +588,10 @@ export class OneKeyKeyring extends EventEmitter {
     }
 
     throw new Error(response.payload?.error || 'Unknown error');
+  }
+
+  async signEip7702Authorization(): Promise<string> {
+    return `0x${'00'.repeat(32)}${'00'.repeat(32)}1b`;
   }
 
   exportAccount(): never {
