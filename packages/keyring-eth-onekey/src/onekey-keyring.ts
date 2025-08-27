@@ -11,8 +11,16 @@ import {
   TransactionType,
 } from '@ethereumjs/tx';
 import * as ethUtil from '@ethereumjs/util';
-import type { MessageTypes, TypedMessage } from '@metamask/eth-sig-util';
-import { SignTypedDataVersion, TypedDataUtils } from '@metamask/eth-sig-util';
+import type {
+  EIP7702Authorization,
+  MessageTypes,
+  TypedMessage,
+} from '@metamask/eth-sig-util';
+import {
+  concatSig,
+  SignTypedDataVersion,
+  TypedDataUtils,
+} from '@metamask/eth-sig-util';
 import type {
   ConnectSettings,
   EthereumSignTypedDataMessage,
@@ -392,17 +400,22 @@ export class OneKeyKeyring extends EventEmitter {
         txData.s = ethUtil.addHexPrefix(payload.s);
 
         if (onekeySignAuthorizationList && isEOACodeEIP7702TxData(txData)) {
-          // @ts-expect-error - OneKey chainID to number conversion
           const { authorizationSignatures } = payload;
           // @ts-expect-error - OneKey chainID to number conversion
           txData.authorizationList = txData.authorizationList?.map(
             (auth, index) => {
               return {
                 ...auth,
-                r: ethUtil.addHexPrefix(authorizationSignatures[index].r),
-                s: ethUtil.addHexPrefix(authorizationSignatures[index].s),
+                r: ethUtil.addHexPrefix(
+                  authorizationSignatures?.[index]?.r ?? '',
+                ),
+                s: ethUtil.addHexPrefix(
+                  authorizationSignatures?.[index]?.s ?? '',
+                ),
                 yParity:
-                  authorizationSignatures[index].yParity === 0 ? '0x' : '0x1',
+                  authorizationSignatures?.[index]?.yParity === 0
+                    ? '0x'
+                    : '0x1',
               };
             },
           );
@@ -450,6 +463,21 @@ export class OneKeyKeyring extends EventEmitter {
             return {
               ...auth,
               chainId: parseInt(auth.chainId?.replace('0x', ''), 16),
+              r: undefined,
+              s: undefined,
+              yParity: undefined,
+            };
+          }
+
+          if (auth.r && auth.s && auth.yParity) {
+            return {
+              ...auth,
+              chainId: parseInt(auth.chainId?.replace('0x', ''), 16),
+              signature: {
+                r: auth.r,
+                s: auth.s,
+                yParity: auth.yParity,
+              },
               r: undefined,
               s: undefined,
               yParity: undefined,
@@ -590,8 +618,66 @@ export class OneKeyKeyring extends EventEmitter {
     throw new Error(response.payload?.error || 'Unknown error');
   }
 
-  async signEip7702Authorization(): Promise<string> {
-    return `0x${'00'.repeat(32)}${'00'.repeat(32)}1b`;
+  async signEip7702Authorization(
+    withAccount: string,
+    authorization: EIP7702Authorization,
+  ): Promise<string> {
+    const details = this.#accountDetailsFromAddress(withAccount);
+
+    const [chainId, contractAddress, nonce] = authorization;
+    const authorizationList = [
+      {
+        chainId,
+        address: contractAddress,
+        nonce: nonce.toString(16),
+      },
+    ];
+
+    const transaction = {
+      to: contractAddress,
+      value: '0x0',
+      data: '0x',
+      chainId,
+      nonce: Math.min(nonce - 1).toString(16),
+      gasLimit: '0x520800',
+      maxFeePerGas: '0x520800',
+      maxPriorityFeePerGas: '0x520800',
+      authorizationList,
+    };
+
+    return this.bridge
+      .ethereumSignTransaction({
+        path: details.hdPath,
+        passphraseState: details.passphraseState ?? '',
+        useEmptyPassphrase: isEmptyPassphrase(details.passphraseState),
+        transaction,
+      })
+      .then((response) => {
+        if (response.success) {
+          const { authorizationSignatures } = response.payload;
+          if (
+            !authorizationSignatures ||
+            authorizationSignatures.length === 0
+          ) {
+            throw new Error('No authorization signature found');
+          }
+          const { r, s, yParity } = authorizationSignatures[0] || {};
+          if (!r || !s || yParity === null || yParity === undefined) {
+            throw new Error('No authorization signature found');
+          }
+          return concatSig(
+            Buffer.from(
+              ethUtil.hexToBytes(addHexPrefix((yParity + 27).toString(16))),
+            ),
+            Buffer.from(ethUtil.hexToBytes(addHexPrefix(r))),
+            Buffer.from(ethUtil.hexToBytes(addHexPrefix(s))),
+          );
+        }
+        throw new Error(response.payload?.error || 'Unknown error');
+      })
+      .catch((error) => {
+        throw new Error(error?.toString() || 'Unknown error');
+      });
   }
 
   exportAccount(): never {

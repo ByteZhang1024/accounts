@@ -1,6 +1,6 @@
 {
   "name": "eth-onekey-bridge-keyring",
-  "version": "0.3.6-alpha.16",
+  "version": "0.3.6-alpha.18",
   "description": "A MetaMask compatible keyring, for onekey hardware wallets",
   "keywords": [
     "ethereum",
